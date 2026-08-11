@@ -369,26 +369,30 @@ class ConsentMixin:
                     sec_fetch_site,
                 )
 
-        # Need consent: issue CSRF token and show HTML
-        if (
-            txn_model.csrf_token
-            and txn_model.csrf_expires_at
-            and time.time() < txn_model.csrf_expires_at
-        ):
-            csrf_token = txn_model.csrf_token
-            csrf_expires_at = txn_model.csrf_expires_at
-        else:
-            csrf_token = secrets.token_urlsafe(32)
-            csrf_expires_at = time.time() + 15 * 60
+        # Issue a fresh CSRF token per GET (prevents fixation: each browser
+        # gets its own token). Store up to 5 active tokens so the original page stays submittable after a browser double-fetch.
+        _MAX_CSRF_TOKENS = 5
+        csrf_token = secrets.token_urlsafe(32)
+        now = time.time()
 
-        # Update transaction with CSRF token
+        if not txn_model.csrf_expires_at or now >= txn_model.csrf_expires_at:
+            txn_model.csrf_tokens = []
+            txn_model.csrf_expires_at = now + 15 * 60
+
+        csrf_expires_at = txn_model.csrf_expires_at
+        
+        # Set the CSRF token for this transaction
         txn_model.csrf_token = csrf_token
-        txn_model.csrf_expires_at = csrf_expires_at
+        txn_model.csrf_tokens = (txn_model.csrf_tokens or []) + [csrf_token]
+        if len(txn_model.csrf_tokens) > _MAX_CSRF_TOKENS:
+            txn_model.csrf_tokens = txn_model.csrf_tokens[-_MAX_CSRF_TOKENS:]
+
         await self._transaction_store.put(
             key=txn_id, value=txn_model, ttl=15 * 60
         )  # Auto-expire after 15 minutes
 
         # Update dict for use in HTML generation
+        # Sending newly generated token
         txn["csrf_token"] = csrf_token
         txn["csrf_expires_at"] = csrf_expires_at
 
@@ -463,10 +467,13 @@ class ConsentMixin:
             )
 
         txn = txn_model.model_dump()
-        expected_csrf = txn.get("csrf_token")
-        expires_at = float(txn.get("csrf_expires_at") or 0)
+        # Fall back to legacy single-token field for in-flight transactions.
+        active_tokens: list[str] = txn_model.csrf_tokens or (
+            [txn_model.csrf_token] if txn_model.csrf_token else []
+        )
+        expires_at = float(txn_model.csrf_expires_at or 0)
 
-        if not expected_csrf or csrf_token != expected_csrf or time.time() > expires_at:
+        if not active_tokens or csrf_token not in active_tokens or time.time() > expires_at:
             return create_secure_html_response(
                 "<h1>Error</h1><p>Invalid or expired consent token</p>", status_code=400
             )
@@ -487,6 +494,11 @@ class ConsentMixin:
                 "Please try authenticating again.</p>",
                 status_code=403,
             )
+
+        # Consume all tokens — no reuse after a successful submit.
+        txn_model.csrf_tokens = []
+        txn_model.csrf_token = None
+        await self._transaction_store.put(key=txn_id, value=txn_model, ttl=15 * 60)
 
         client_key = self._make_client_key(txn["client_id"], txn["client_redirect_uri"])
 

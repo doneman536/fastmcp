@@ -540,19 +540,13 @@ class TestCSRFDoubleSubmit:
 class TestConsentPageDoubleFetch:
     """Regression tests for double-fetch CSRF invalidation.
 
-    Some browser extensions and built-in prefetch mechanisms re-fetch the
-    consent page URL immediately after the browser receives it (same IP/UA,
-    0.2-1.2 s apart).  Before the fix, each GET issued a *fresh* one-time
-    CSRF token and overwrote the transaction's stored token, so the first
-    page's token became invalid and the user's POST returned 400.
-
-    The fix: reuse ``csrf_token`` / ``csrf_expires_at`` already stored in
-    the transaction as long as they have not expired.
+    Each GET issues a fresh independent token (prevents fixation) stored in
+    a capped per-transaction list, so the original page stays submittable
+    even after a browser double-fetch. Tokens are consumed on submit.
     """
 
-    async def test_double_get_returns_same_csrf_token(self, oauth_proxy_with_storage):
-        """A second GET to /consent within the 15-minute window must return the
-        same CSRF token as the first — not a freshly generated one."""
+    async def test_double_get_issues_distinct_csrf_tokens(self, oauth_proxy_with_storage):
+        """Each GET /consent must return a distinct token (prevents fixation)."""
         txn_id, _ = await _start_flow(
             oauth_proxy_with_storage,
             "double-fetch-client-a",
@@ -569,23 +563,14 @@ class TestConsentPageDoubleFetch:
             csrf1 = _extract_csrf(first.text)
             csrf2 = _extract_csrf(second.text)
 
-            assert csrf1 is not None, "first page must contain csrf_token"
-            assert csrf2 is not None, "second page must contain csrf_token"
-            assert csrf1 == csrf2, (
-                "second fetch must reuse the existing CSRF token; "
-                "a new token would invalidate the page the user is looking at"
-            )
+            assert csrf1 is not None
+            assert csrf2 is not None
+            assert csrf1 != csrf2, "each GET must issue a fresh token"
 
     async def test_consent_submittable_after_page_double_fetch(
         self, oauth_proxy_with_storage
     ):
-        """After a browser double-fetches the consent page, the user's POST
-        (using the CSRF token from the *first* page) must still succeed (302).
-
-        Reproduces the production failure described in the issue:
-        users whose browser extension re-fetches the URL could never complete
-        authorization because the second GET rotated the stored token.
-        """
+        """First page's token must still work after a browser double-fetch."""
         txn_id, _ = await _start_flow(
             oauth_proxy_with_storage,
             "double-fetch-client-b",
@@ -593,31 +578,62 @@ class TestConsentPageDoubleFetch:
         )
         app = Starlette(routes=oauth_proxy_with_storage.get_routes())
         with TestClient(app) as c:
-            # First GET — the page the user actually sees.
             first_response = c.get(f"/consent?txn_id={txn_id}")
             assert first_response.status_code == 200
 
-            # Seed the CSRF cookies from the first response.
             for k, v in first_response.cookies.items():
                 c.cookies.set(k, v)
 
             csrf = _extract_csrf(first_response.text)
-            assert csrf, "CSRF token must be present in the consent page"
+            assert csrf
 
-            # Second GET — simulates a browser extension or prefetch re-fetch.
+            # Simulates browser extension re-fetching the URL.
             second_response = c.get(f"/consent?txn_id={txn_id}")
             assert second_response.status_code == 200
 
-            # User clicks Allow on the *first* page they saw.
             submit = c.post(
                 "/consent",
                 data={"action": "approve", "txn_id": txn_id, "csrf_token": csrf},
                 follow_redirects=False,
             )
             assert submit.status_code in (302, 303), (
-                f"Expected redirect after approve, got {submit.status_code}; "
-                f"body: {submit.content}"
+                f"got {submit.status_code}: {submit.content}"
             )
+
+    async def test_attacker_token_rejected_with_victim_cookie(
+        self, oauth_proxy_with_storage
+    ):
+        """Attacker's token must be rejected when submitted with the victim's cookie."""
+        txn_id, _ = await _start_flow(
+            oauth_proxy_with_storage,
+            "double-fetch-client-c",
+            "http://localhost:9093/callback",
+        )
+        app = Starlette(routes=oauth_proxy_with_storage.get_routes())
+
+        with TestClient(app) as attacker:
+            attacker_page = attacker.get(f"/consent?txn_id={txn_id}")
+            assert attacker_page.status_code == 200
+            attacker_csrf = _extract_csrf(attacker_page.text)
+            assert attacker_csrf
+
+        with TestClient(app) as victim:
+            victim_page = victim.get(f"/consent?txn_id={txn_id}")
+            assert victim_page.status_code == 200
+            for k, v in victim_page.cookies.items():
+                victim.cookies.set(k, v)
+
+            forged = victim.post(
+                "/consent",
+                data={
+                    "action": "approve",
+                    "txn_id": txn_id,
+                    "csrf_token": attacker_csrf,
+                },
+                follow_redirects=False,
+            )
+            assert forged.status_code == 403
+
 
 
 class TestStoragePersistence:

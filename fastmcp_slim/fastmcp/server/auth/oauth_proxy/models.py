@@ -60,6 +60,7 @@ class OAuthTransaction(BaseModel):
     proxy_code_verifier: str | None = None
     csrf_token: str | None = None
     csrf_expires_at: float | None = None
+    csrf_tokens: list[str] = []
     consent_token: str | None = None
 
 
